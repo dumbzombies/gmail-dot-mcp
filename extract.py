@@ -34,6 +34,9 @@ TRACKING_HINTS = (
 )
 BAD_LINK_HINTS = (
     "unsubscribe",
+    "optout",
+    "opt-out",
+    "prefs",
     "privacy",
     "terms",
     "preferences",
@@ -46,6 +49,18 @@ BAD_LINK_HINTS = (
     ".svg",
     ".webp",
     ".woff",
+)
+# Anchor text that marks a link as boilerplate no matter what its URL looks like:
+# "Unsubscribe" wrapped around a token= query string is still an unsubscribe link.
+BAD_ANCHOR_WORDS = (
+    "unsubscribe",
+    "opt out",
+    "opt-out",
+    "preferences",
+    "email settings",
+    "view in browser",
+    "view online",
+    "read online",
 )
 GOOD_LINK_WORDS = (
     "verify",
@@ -227,12 +242,24 @@ def find_link(
     anchors = _anchor_text(html)
     scored: list[tuple[int, int, str]] = []
     for index, url in enumerate(link_candidates(text, html)):
+        lowered = url.lower()
+        # Hard veto: "unsubscribe"/"privacy"/"terms"/asset URLs are never the link we
+        # want, and a query string containing "token" must not rescue them.
+        if any(hint in lowered for hint in BAD_LINK_HINTS):
+            continue
+        # Hard veto by anchor text too: "Unsubscribe" / "Read online" wrapped around a
+        # token-bearing URL is boilerplate, and the URL alone gives no hint of that.
+        anchor = anchors.get(url, "").lower()
+        if any(word in anchor for word in BAD_ANCHOR_WORDS):
+            continue
         score = score_link(url, anchor=anchors.get(url, ""), keyword=keyword, sender=sender)
         scored.append((score, -index, url))
     if not scored:
         return None
     scored.sort(reverse=True)
-    candidates = [item[2] for item in scored if item[0] > -200][:8]
+    # Only links that look like a verification target qualify: a bare tracking/newsletter
+    # link scores 0 at best, and handing that to the agent is worse than returning nothing.
+    candidates = [item[2] for item in scored if item[0] > 0][:8]
     if not candidates:
         return None
     return candidates[0], candidates

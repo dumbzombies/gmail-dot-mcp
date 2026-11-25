@@ -107,15 +107,27 @@ missed it".
 
 - **Exact-string matching.** Gmail's `To:` header search ignores dots, so it
   matches every alias at once. This server fetches headers and re-filters on the
-  exact recipient, which is what keeps two aliases' mail separate.
+  literal recipient (`To` / `X-Original-To` / `Delivered-To`), dots included —
+  `From` and `Subject` are not consulted, so a mail that merely *mentions* an
+  alias never lands in that alias's inbox.
+- **BCC still works.** When a form delivers the mail in the envelope only (no
+  `To:` at all, or the account address in it), the topmost `Received:` header's
+  `for <address>` clause is matched the same way — it is the one dot-exact trace
+  a BCC delivery leaves, and the one Gmail's own search cannot see.
+- **Links are qualified, not guessed.** A URL is returned only if it looks like a
+  verification target (keyword in the URL, a `verify`/`confirm`-style anchor, or
+  the sender's own domain). Tracking and unsubscribe URLs are vetoed outright, so
+  a newsletter never produces a fake "found".
 - **Watermarks.** `new_address` records the inbox's highest UID *before* returning,
   so only mail that arrives afterwards is matched. On a hit the watermark
   advances, so reusing one alias never replays the previous code.
 - **Spam.** After 15 s of waiting, `[Gmail]/Spam` is scanned too (its UIDs are a
   separate space, so a date bound is used instead).
-- **`mode`.** `dots` (default) inserts 1–3 dots. `plus` appends `+mm<random>`.
-  Short local parts and a fully exhausted dot space fall back to `plus`; the
-  returned `mode` is what was actually used.
+- **`mode`.** `dots` (default) inserts a random count of dots (1–8, tunable with
+  `GMAIL_MCP_MAX_DOTS`) at random positions — for a normal-length local part that
+  is 10⁶+ distinct strings, so the same alias practically never comes up twice.
+  `plus` appends `+mm<random>`. Short local parts and a fully exhausted dot space
+  fall back to `plus`; the returned `mode` is what was actually used.
 - **Read-only.** Mail is fetched with `BODY.PEEK`, so nothing is ever marked read,
   moved, or deleted. The only write to your account is `--self-test`, which mails
   itself.
@@ -156,6 +168,20 @@ for it.
 The extraction heuristics live in `extract.py` and are plain functions; if a
 particular sender's template defeats them, fix the scoring there rather than
 patching the server.
+
+## Tests
+
+```bash
+python3 tests/run_tests.py           # offline: fakes IMAP, ~2 s
+python3 tests/run_tests.py --live    # real mailbox round trip (needs an account)
+python3 tests/stdio_smoke.py         # speaks MCP over stdio to server.py
+```
+
+The live run creates a throwaway alias, BCCs itself through `smtp.gmail.com`, and
+checks the envelope-only path, the replay guard, and the `inbox()` view; the alias
+is deleted afterwards. `stdio_smoke.py` checks the wire protocol — tool list,
+descriptions, JSON shapes, and that bad arguments come back as tool errors rather
+than as a crashed server.
 
 ## License
 

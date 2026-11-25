@@ -9,7 +9,6 @@ import email
 import imaplib
 import json
 import os
-import random
 import re
 import secrets
 import smtplib
@@ -38,6 +37,7 @@ POLL_INTERVAL = 4
 SPAM_AFTER = 15.0
 MIN_PASS = 3.0
 MAX_FETCH = 10
+MAX_SCAN = 60
 DEFAULT_WAIT = 120
 MAX_WAIT = 600
 MAX_ALIASES = 500
@@ -46,16 +46,31 @@ CONFIG_DIR = Path.home() / ".config" / "gmail-mcp"
 ACCOUNTS = CONFIG_DIR / "accounts.json"
 STATE = CONFIG_DIR / "state.json"
 
-HEADER_FIELDS = "(BODY.PEEK[HEADER.FIELDS (TO DELIVERED-TO X-ORIGINAL-TO FROM SUBJECT DATE MESSAGE-ID)])"
-RECIPIENT_HEADERS = ("To", "Delivered-To", "X-Original-To", "From", "Subject")
+HEADER_FIELDS = "(BODY.PEEK[HEADER.FIELDS (TO DELIVERED-TO X-ORIGINAL-TO RECEIVED FROM SUBJECT DATE MESSAGE-ID)])"
+# Recipient headers used to attribute a message to one exact alias. From/Subject are
+# deliberately absent: a matching string in the sender or the subject (e.g. the account
+# mailing its own alias) must never count as delivery to the alias.
+RECIPIENT_HEADERS = ("To", "X-Original-To", "Delivered-To")
+# Maximum number of dots new_address() may insert (overridable with GMAIL_MCP_MAX_DOTS).
+try:
+    MAX_DOTS = max(1, min(15, int(os.environ.get("GMAIL_MCP_MAX_DOTS") or 8)))
+except ValueError:
+    MAX_DOTS = 8
 
 _STATE_LOCK = threading.Lock()
+
+# Envelope recipient of the delivering hop: "... for <alias@gmail.com> (version=TLS1_3)".
+ENVELOPE_RE = re.compile(
+    r"\bfor\s+(?:<([^<>\s]+@[^<>\s]+)>|([^\s<>;()]+@[^\s<>;()]+))", re.IGNORECASE
+)
 
 INSTRUCTIONS = """Signup flow in three calls: new_address() -> paste the exact address string into the
 signup form -> wait_code() (no arguments; it uses the newest alias). wait_code returns
 {"code": "...", "link": "..."}; use whichever the form asks for, and call inbox() to
-debug when nothing arrives. Aliases are Gmail dot-tricks: every one delivers to the same
-real inbox, so use the exact string that new_address returned."""
+debug when nothing arrives. Aliases are Gmail dot-tricks with a random dot count in random
+positions: every one delivers to the same real inbox, so use the exact string that
+new_address returned. Mail is matched only when the literal recipient equals that string,
+so a different dot variant never shows up in another alias's inbox."""
 
 
 # ---------------------------------------------------------------- results
@@ -82,6 +97,8 @@ class WaitResult(TypedDict):
 
 class InboxRow(TypedDict):
     uid: int
+    folder: str
+    to: str
     sender: str
     subject: str
     received_at: str
@@ -140,14 +157,23 @@ def _load_accounts() -> list[dict[str, str]]:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"aliases": {}, "order": [], "last_account": 0}
+    return {"aliases": {}, "order": [], "last_account": -1}
 
 
 def _load_state() -> dict[str, Any]:
     path = STATE
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except FileNotFoundError:
+        return _empty_state()
+    except Exception as exc:
+        # Never silently wipe a state file we failed to parse: keep a copy for recovery.
+        try:
+            backup = path.with_suffix(f".json.corrupt-{int(time.time())}")
+            path.replace(backup)
+            _log(f"state unreadable ({type(exc).__name__}); moved to {backup.name}")
+        except Exception:
+            _log(f"state unreadable ({type(exc).__name__}); starting empty")
         return _empty_state()
     if not isinstance(raw, dict):
         return _empty_state()
@@ -158,7 +184,7 @@ def _load_state() -> dict[str, Any]:
     return {
         "aliases": aliases,
         "order": [str(a) for a in order],
-        "last_account": raw.get("last_account") if isinstance(raw.get("last_account"), int) else 0,
+        "last_account": raw.get("last_account") if isinstance(raw.get("last_account"), int) else -1,
     }
 
 
@@ -174,7 +200,10 @@ def _save_state(state: dict[str, Any]) -> None:
     except OSError:
         pass
     tmp = STATE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(state, indent=1))
+        handle.flush()
+        os.fsync(handle.fileno())
     os.chmod(tmp, 0o600)
     os.replace(tmp, STATE)
 
@@ -195,9 +224,18 @@ def _save_accounts(accounts: list[dict[str, str]]) -> None:
 def _account_for(address: str) -> dict[str, str]:
     accounts = _load_accounts()
     probe = str(address or "").strip()
-    local = probe.split("@", 1)[0].replace(".", "").split("+", 1)[0].lower()
+    if "@" not in probe:
+        raise ToolError(f"not an email address: {probe!r}")
+    local, _, domain = probe.partition("@")
+    canonical = local.replace(".", "").split("+", 1)[0].lower()
+    domain = domain.lower()
     for account in accounts:
-        if account["email"].split("@", 1)[0].replace(".", "").split("+", 1)[0].lower() == local and local:
+        account_local, _, account_domain = account["email"].partition("@")
+        if (
+            canonical
+            and canonical == account_local.replace(".", "").split("+", 1)[0].lower()
+            and domain == account_domain.lower()
+        ):
             return account
     configured = ", ".join(a["email"] for a in accounts)
     raise ToolError(f"no gmail account matches '{probe}' (configured: {configured})")
@@ -234,15 +272,35 @@ def _decode(value: object) -> str:
 
 
 def _connect(account: dict[str, str]) -> imaplib.IMAP4_SSL:
+    """Open and authenticate one IMAP session.
+
+    Bad credentials raise ``ToolError`` (permanent, the user has to fix it); transport
+    problems raise ``_Transient`` so a wait loop can retry instead of dying on a blip.
+    """
     try:
         box = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=30)
+    except (OSError, imaplib.IMAP4.error) as exc:
+        raise _Transient(f"imap connect failed: {type(exc).__name__}: {exc}") from None
+    try:
         box.login(account["email"], account["app_password"])
         return box
-    except Exception as exc:
+    except imaplib.IMAP4.error as exc:
+        _logout(box)
         raise ToolError(
             f"gmail login failed for {account.get('email', '?')}: {type(exc).__name__} — if this is "
             "AUTHENTICATIONFAILED, regenerate the app password at https://myaccount.google.com/apppasswords"
         ) from None
+    except Exception as exc:
+        _logout(box)
+        raise _Transient(f"gmail login interrupted: {type(exc).__name__}: {exc}") from None
+
+
+def _open(account: dict[str, str]) -> imaplib.IMAP4_SSL:
+    """``_connect`` for one-shot callers: a transport failure becomes a clean ToolError."""
+    try:
+        return _connect(account)
+    except _Transient as exc:
+        raise ToolError(f"imap unavailable, try again: {exc}") from None
 
 
 def _logout(box: imaplib.IMAP4_SSL | None) -> None:
@@ -279,10 +337,30 @@ def _body_parts(message: email.message.Message) -> tuple[str, str]:
 
 
 def _recipients(message: email.message.Message) -> set[str]:
+    """Literal recipient addresses (To / X-Original-To / Delivered-To / envelope) of a message.
+
+    Dots are preserved on purpose. Gmail treats ``a.b@`` and ``ab@`` as one mailbox, but
+    attribution here is by the exact string, so mail addressed to a different dot variant
+    (or to the bare account address) must not be credited to this alias.
+
+    The envelope recipient in the topmost ``Received:`` header ("... for <addr>") is
+    included because it is the only dot-exact trace of a BCC delivery that survives
+    local delivery, and it is what Gmail's own searches are blind to.
+    """
     values: list[str] = []
     for header in RECIPIENT_HEADERS:
         values.extend(str(value) for value in message.get_all(header, []))
-    return {address.lower() for _name, address in getaddresses(values) if address}
+    received = message.get("Received")
+    if received:
+        match = ENVELOPE_RE.search(str(received))
+        if match:
+            values.append(match.group(1) or match.group(2) or "")
+    return {address.strip().lower() for _name, address in getaddresses(values) if address}
+
+
+def _addressed_exactly(message: email.message.Message, alias: str) -> bool:
+    """True only when ``alias`` (dots included) is one of the message's recipients."""
+    return alias.strip().lower() in _recipients(message)
 
 
 def _raw_payload(fetched: object) -> bytes:
@@ -295,7 +373,7 @@ def _raw_payload(fetched: object) -> bytes:
 
 
 def _max_uid(account: dict[str, str]) -> int:
-    box = _connect(account)
+    box = _open(account)
     try:
         box.select("INBOX", readonly=True)
         status, data = box.uid("SEARCH", None, "ALL")
@@ -353,25 +431,43 @@ def _search_uids(
     since_date: str = "",
     cap: int = MAX_FETCH,
 ) -> list[int]:
-    """Search ``To:`` then keep only exact-recipient matches.
+    """Search ``To:`` then keep only messages addressed to this exact alias string.
 
-    Gmail's header search ignores dots, so the SEARCH result is a superset and
-    the exact ``To:`` string filter below is what makes grouping correct.
+    Gmail's header search ignores dots, so a SEARCH for one dot variant returns every mail
+    sent to *any* variant of the account (and to the bare address). ``_addressed_exactly``
+    is what makes the result "this alias's inbox only": the literal ``To``/``Delivered-To``
+    address must equal ``alias``, dots and all.
     """
-    criteria: list[object] = ["HEADER", "To", alias]
+    terms: list[list[object]] = [
+        ["HEADER", "To", alias],
+        ["HEADER", "Delivered-To", alias],
+        ["HEADER", "X-Original-To", alias],
+    ]
     if since_date:
-        criteria.extend(["SINCE", since_date])
-    try:
-        status, data = box.uid("SEARCH", None, *criteria)
-    except Exception as exc:
-        raise _Transient(f"{type(exc).__name__}: {exc}") from None
-    if status != "OK":
+        terms = [term + ["SINCE", since_date] for term in terms]
+    found: set[int] = set()
+    failures = 0
+    for term in terms:
+        try:
+            status, data = box.uid("SEARCH", None, *term)
+        except Exception as exc:
+            failures += 1
+            _log(f"search on {term[1]} failed: {type(exc).__name__}: {exc}")
+            continue
+        if status != "OK":
+            failures += 1
+            continue
+        found.update(_uid_list(data))
+    if failures == len(terms):
         raise _Transient("search rejected")
-    uids = sorted(_uid_list(data), reverse=True)
+    uids = sorted(found, reverse=True)
     if since_uid is not None:
         uids = [uid for uid in uids if uid > since_uid]
+    # The superset can be the whole account; only the newest slice can hold a fresh
+    # verification mail, so never spend more than MAX_SCAN header fetches on it.
+    uids = uids[:MAX_SCAN]
     kept: list[int] = []
-    wanted = alias.lower()
+    wanted = alias.strip().lower()
     for uid in uids:
         if len(kept) >= max(1, cap):
             break
@@ -388,7 +484,7 @@ def _search_uids(
             header = email.message_from_bytes(raw, policy=policy.default)
         except Exception:
             continue
-        if wanted not in _recipients(header):
+        if not _addressed_exactly(header, wanted):
             continue
         kept.append(uid)
     return kept
@@ -407,6 +503,41 @@ def _imap_date(value: str) -> str:
     return parsed.strftime("%d-%b-%Y")
 
 
+def _select(box: imaplib.IMAP4_SSL, folder: str) -> bool:
+    """Select ``folder`` read-only; False when the mailbox does not exist or is refused."""
+    try:
+        status, _data = box.select(folder, readonly=True)
+    except Exception:
+        return False
+    return status == "OK"
+
+
+def _spam_folder(box: imaplib.IMAP4_SSL) -> str:
+    """Name of the account's spam mailbox, discovered from the \\Spam attribute.
+
+    Hardcoding ``[Gmail]/Spam`` breaks on accounts whose folders are localised (and on
+    legacy ``[Google Mail]`` ones); a missing mailbox would otherwise make every poll
+    pass fail once the spam scan kicks in.
+    """
+    try:
+        status, rows = box.list()
+    except Exception:
+        return "[Gmail]/Spam"
+    if status == "OK":
+        for row in rows or []:
+            if not isinstance(row, (bytes, bytearray)):
+                continue
+            text = bytes(row).decode("utf-8", "replace")
+            match = re.match(r"\(([^)]*)\)\s+(?:\"[^\"]*\"|NIL)\s+(.+)$", text)
+            if not match:
+                continue
+            flags = match.group(1).lower()
+            name = match.group(2).strip().strip('"')
+            if "\\spam" in flags or "\\junk" in flags:
+                return name
+    return "[Gmail]/Spam"
+
+
 def _scan_folder(
     box: imaplib.IMAP4_SSL,
     folder: str,
@@ -415,12 +546,16 @@ def _scan_folder(
     preview: dict[str, Any] | None,
     since_uid: int | None,
     since_date: str,
+    skip_ids: set[str] | None = None,
 ) -> tuple[tuple[dict[str, Any], str] | None, dict[str, Any] | None]:
-    box.select(folder, readonly=True)
+    if not _select(box, folder):
+        return None, preview
     uids = _search_uids(box, alias, since_uid=since_uid, since_date=since_date, cap=MAX_FETCH)
     for uid in uids:  # newest first
         message = _fetch(box, uid, folder)
         if message is None:
+            continue
+        if skip_ids and message.get("message_id") in skip_ids:
             continue
         found = extract.find_code(message["subject"], message["text"], message["html"], digits)
         if found:
@@ -438,6 +573,7 @@ def _poll(
     since_uid: int,
     digits: int,
     timeout: int,
+    skip_ids: set[str] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     timeout = max(5, min(MAX_WAIT, int(timeout)))
     started = time.monotonic()
@@ -450,46 +586,60 @@ def _poll(
     entry = (state.get("aliases") or {}).get(alias) or {}
     created = str(entry.get("created_at") or "")
     spam_since = _imap_date(created)
+    skip_ids = set(skip_ids or ())
+    if entry.get("last_hit"):
+        skip_ids.add(str(entry["last_hit"]))
 
-    while True:
-        if passes and deadline - time.monotonic() < MIN_PASS:
-            break
-        passes += 1
-        include_spam = (time.monotonic() - started) >= SPAM_AFTER
-        box: imaplib.IMAP4_SSL | None = None
-        try:
-            box = _connect(account)
-            hit = None
-            for folder, uid_floor, date_bound in (
-                ("INBOX", since_uid, ""),
-                ("[Gmail]/Spam", None, spam_since),
-            ):
-                if folder != "INBOX" and not include_spam:
-                    continue
-                hit, preview = _scan_folder(
-                    box, folder, alias, digits, preview, uid_floor, date_bound
-                )
-                if hit is not None:
-                    return hit
-        except ToolError:
-            raise
-        except _Transient as exc:
-            errors += 1
-            last_error = str(exc)
-            _log(f"pass failed (retrying): {last_error}")
-        except Exception as exc:
-            errors += 1
-            last_error = f"{type(exc).__name__}: {exc}"
-            _log(f"pass failed (retrying): {last_error}")
-        finally:
-            _logout(box)
+    box: imaplib.IMAP4_SSL | None = None
+    try:
+        while True:
+            if passes and deadline - time.monotonic() < MIN_PASS:
+                break
+            passes += 1
+            include_spam = (time.monotonic() - started) >= SPAM_AFTER
+            pass_started = time.monotonic()
+            try:
+                # Reuse the session across passes: logging in again every few seconds trips
+                # Gmail's connection throttling and stretches a 60s wait into minutes.
+                if box is None:
+                    box = _connect(account)
+                folders: list[tuple[str, int | None, str]] = [("INBOX", since_uid, "")]
+                if include_spam:
+                    spam = _spam_folder(box)
+                    if spam:
+                        folders.append((spam, None, spam_since))
+                for folder, uid_floor, date_bound in folders:
+                    hit, preview = _scan_folder(
+                        box, folder, alias, digits, preview, uid_floor, date_bound, skip_ids
+                    )
+                    if hit is not None:
+                        return hit
+            except ToolError:
+                raise
+            except _Transient as exc:
+                errors += 1
+                last_error = str(exc)
+                _log(f"pass failed (retrying): {last_error}")
+                _logout(box)
+                box = None
+            except Exception as exc:
+                errors += 1
+                last_error = f"{type(exc).__name__}: {exc}"
+                _log(f"pass failed (retrying): {last_error}")
+                _logout(box)
+                box = None
+            elapsed = time.monotonic() - pass_started
+            if elapsed > 5:
+                _log(f"pass {passes} took {elapsed:.1f}s")
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(POLL_INTERVAL, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(POLL_INTERVAL, remaining))
+    finally:
+        _logout(box)
 
-    if passes and errors == passes:
+    if errors and passes <= errors:
         raise ToolError(f"imap error: {last_error or 'all attempts failed'}")
 
     return preview, ""
@@ -499,15 +649,29 @@ def _poll(
 
 
 def _dotted_local(local: str, taken: set[str]) -> str:
-    count = random.randint(1, max(1, min(3, len(local) - 1)))
-    positions = sorted(random.sample(range(1, len(local)), count))
-    dotted = local
-    for position in reversed(positions):
-        dotted = dotted[:position] + "." + dotted[position:]
-    if dotted == local or ".." in dotted or dotted.startswith(".") or dotted.endswith("."):
+    """Dotted variant of ``local`` with a random dot count in random positions.
+
+    The count is drawn uniformly from 1..MAX_DOTS (bounded by the local part's length),
+    so for a normal-length local part the space is ~10^6 distinct strings -- repeating
+    one across hundreds of signups is very unlikely. Uses ``secrets`` so the pattern does
+    not depend on the module-level PRNG state.
+    """
+    if len(local) < 2:
         return ""
-    address = f"{dotted}@gmail.com"
-    return "" if address in taken else address
+    max_dots = max(1, min(MAX_DOTS, len(local) - 1))
+    rnd = secrets.SystemRandom()
+    for _ in range(40):
+        count = rnd.randint(1, max_dots)
+        positions = sorted(rnd.sample(range(1, len(local)), count))
+        dotted = local
+        for position in reversed(positions):
+            dotted = dotted[:position] + "." + dotted[position:]
+        if dotted == local or ".." in dotted or dotted.startswith(".") or dotted.endswith("."):
+            continue
+        address = f"{dotted}@gmail.com"
+        if address not in taken:
+            return address
+    return ""
 
 
 def _plus_local(local: str, taken: set[str]) -> str:
@@ -525,7 +689,10 @@ def _create_alias(label: str = "", mode: str = "dots") -> NewAddress:
     accounts = _load_accounts()
     with _STATE_LOCK:
         state = _load_state()
-        index = (int(state.get("last_account") or 0) + 1) % len(accounts)
+        last = state.get("last_account")
+        # -1 on a fresh state so the first alias lands on the first account instead of
+        # silently skipping it until the rotation wraps around.
+        index = (int(last) + 1) % len(accounts) if isinstance(last, int) else 0
         state["last_account"] = index
         _save_state(state)
     account = accounts[index]
@@ -600,18 +767,27 @@ def _wait(address: str = "", digits: int = 6, timeout: int = DEFAULT_WAIT) -> Wa
         )
         if found:
             link = found[0]
-    hit = bool(code or link)
-    if hit and message is not None and message.get("folder") == "INBOX":
+    # "found" means a mail addressed exactly to this alias arrived -- not that a code was
+    # parsed out of it. A mail with neither code nor link still gets reported (subject,
+    # sender, preview) so the caller can read it instead of waiting out the timeout.
+    hit = message is not None
+    if hit:
         with _STATE_LOCK:
             live = _load_state()
-            live.setdefault("aliases", {})[target] = {
+            fresh = {
                 **entry,
                 "account": account["email"],
-                "base_uid": int(message["uid"]),
+                # Spam UIDs live in a different sequence, so the INBOX watermark only
+                # advances on an INBOX hit; the message-id guard below covers both.
+                "base_uid": int(message["uid"])
+                if message.get("folder") == "INBOX"
+                else int(entry.get("base_uid") or 0),
+                "last_hit": str(message.get("message_id") or ""),
                 "created_at": entry.get("created_at")
                 or datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "label": entry.get("label", ""),
             }
+            live.setdefault("aliases", {})[target] = fresh
             _save_state(live)
     return {
         "found": hit,
@@ -636,37 +812,51 @@ def _inbox(address: str = "", limit: int = 10) -> Inbox:
     since_uid = entry.get("base_uid")
     if not isinstance(since_uid, int) or since_uid <= 0:
         since_uid = max(0, _max_uid(account) - 200)
+    spam_since = _imap_date(str(entry.get("created_at") or ""))
     rows: list[InboxRow] = []
-    box = _connect(account)
+    box = _open(account)
     try:
-        box.select("INBOX", readonly=True)
-        uids = _search_uids(box, target, since_uid=since_uid, cap=limit)
-        for uid in uids:
-            message = _fetch(box, uid, "INBOX")
-            if message is None:
+        # Include spam: wait_code() scans it, so a debug view that hid it would report
+        # "nothing arrived" for exactly the mail the waiter just matched.
+        folders: list[tuple[str, int | None, str]] = [("INBOX", since_uid, "")]
+        spam = _spam_folder(box)
+        if spam:
+            folders.append((spam, None, spam_since))
+        for folder, uid_floor, date_bound in folders:
+            if not _select(box, folder):
                 continue
-            found_code = extract.find_code(
-                message["subject"], message["text"], message["html"], 6
+            uids = _search_uids(
+                box, target, since_uid=uid_floor, since_date=date_bound, cap=limit
             )
-            found_link = extract.find_link(
-                message["subject"], message["text"], message["html"], message["sender"]
-            )
-            rows.append(
-                {
-                    "uid": int(uid),
-                    "sender": message["sender"],
-                    "subject": message["subject"],
-                    "received_at": message["received_at"],
-                    "preview": _preview_of(message),
-                    "code": found_code[0] if found_code else "",
-                    "link": found_link[0] if found_link else "",
-                }
-            )
+            for uid in uids:
+                message = _fetch(box, uid, folder)
+                if message is None:
+                    continue
+                found_code = extract.find_code(
+                    message["subject"], message["text"], message["html"], 6
+                )
+                found_link = extract.find_link(
+                    message["subject"], message["text"], message["html"], message["sender"]
+                )
+                rows.append(
+                    {
+                        "uid": int(uid),
+                        "folder": folder,
+                        "to": message["to"],
+                        "sender": message["sender"],
+                        "subject": message["subject"],
+                        "received_at": message["received_at"],
+                        "preview": _preview_of(message),
+                        "code": found_code[0] if found_code else "",
+                        "link": found_link[0] if found_link else "",
+                    }
+                )
     except _Transient as exc:
         raise ToolError(f"imap error: {exc}") from None
     finally:
         _logout(box)
-    return {"address": target, "messages": rows}
+    rows.sort(key=lambda row: str(row.get("received_at") or ""), reverse=True)
+    return {"address": target, "messages": rows[:limit]}
 
 
 srv = MCPServer("gmail-dot", version="1.0.0", instructions=INSTRUCTIONS)
@@ -680,13 +870,13 @@ def new_address(label: str = "", mode: str = "dots") -> NewAddress:
 
 @srv.tool()
 def wait_code(address: str = "", digits: int = 6, timeout: int = DEFAULT_WAIT) -> WaitResult:
-    """Block until a verification code or link arrives for the alias (default 120s) and return it. Call right after submitting the form; no address = the newest alias from new_address()."""
+    """Block until a mail arrives for the alias (default 120s) and return it. Call right after submitting the form; no address = the newest alias from new_address(). found=true means the mail arrived; code/link are empty when the mail carried neither, so read subject/preview then."""
     return _wait(address, digits, timeout)
 
 
 @srv.tool()
 def inbox(address: str = "", limit: int = 10) -> Inbox:
-    """Debug view: recent mail delivered to an alias, with any code or link already extracted."""
+    """Debug view of one alias's inbox: mail addressed to *that exact dotted address only*, newest first, with any code or link already extracted. Shows only messages newer than the last UID wait_code() consumed (so it reads empty right after a successful wait — that mail was already handed to you)."""
     return _inbox(address, limit)
 
 
@@ -747,7 +937,7 @@ def _self_test() -> int:
         return 0
 
     print("falling back to IMAP APPEND fixture", flush=True)
-    box = _connect(account)
+    box = _open(account)
     try:
         box.append("INBOX", "\\Seen", None, msg.as_bytes())
     finally:
@@ -763,7 +953,7 @@ def _cli_add(address: str, password: str) -> int:
         return 2
     account = {"email": address, "app_password": normalized}
     try:
-        box = _connect(account)
+        box = _open(account)
         try:
             box.select("INBOX", readonly=True)
             status, data = box.uid("SEARCH", None, "ALL")
@@ -809,7 +999,7 @@ def _cli_doctor() -> int:
     for account in accounts:
         started = time.monotonic()
         try:
-            box = _connect(account)
+            box = _open(account)
             try:
                 box.select("INBOX", readonly=True)
                 status, data = box.uid("SEARCH", None, "ALL")
